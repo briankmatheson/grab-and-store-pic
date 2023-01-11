@@ -1,28 +1,264 @@
 extern crate hyper;
 extern crate futures;
+extern crate url;
+extern crate maud;
 
 #[macro_use]
 extern crate log;
 extern crate env_logger;
-use hyper::server::{Request, Response, Service};
-use futures::future::Future;
+#[macro_use]
+extern crate serde_json;
+#[macro_use]
+extern crate serde;
+#[macro_use]
+extern crate diesel;
+
+use std::collections::HashMap;
+use std::io;
+use std::error::Error;
+use std::env;
+use std::pin::Pin;
+
+use futures::future::{Future};
+
+use hyper::{Server, Body, Request, Response, Result, StatusCode};
+use hyper::service::Service;
+use hyper::header::HeaderValue;
+
+use diesel::prelude::*;
+use diesel::pg::PgConnection;
+
+use url::Url;
+
+mod models;
+mod schema;
+
+use crate::models::{Message, NewMessage};
+
+
+const DEFAULT_DATABASE_URL: &'static str = "postgres://postgres:b144rgH!@localhost/grab-and-store-pic";
+
+
+struct TimeRange {
+    before: Option<i64>,
+    after: Option<i64>,
+}
 
 struct Microservice;
 
-impl Service for Microservice {
-    type Request = Request;
-    type Response = Response;
+impl Service<Request<()>> for Microservice {
+    //type Request = hyper::Request;
+    type Response = hyper::Response<()>;
     type Error = hyper::Error;
-    type Future = Box<dyn Future<Item = Self::Response, Error = Self::Error>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response>>>>;
 
-    fn call(&self, request: Request) -> Self::Future {
+    fn call(self: &mut Microservice, request: Request<()>) -> hyper::Result<()> {
 	info!("Microservice received a request: {:?}", request);
-	Box::new(futures::future::ok(Response::new()))
+	let mut db_connection = match connect_to_db() {
+            Some(connection) => connection,
+            None => {
+		return Box::new(futures::future::ok(
+                    Response::new().with_status(StatusCode::InternalServerError),
+		))
+            }
+	};
+	info!("Got DB connection");
+
+	match (request.method(), request.path()) {
+	    (&Get, "/") => {
+		info!("Hey, it's a get from /!");
+		let time_range = match request.query() {
+		    Some(query) => parse_query(query),
+		    None => Ok(TimeRange {
+			before: None,
+			after: None,
+		    }),
+		};
+		let response = match time_range {
+		    Ok(time_range) => make_get_response(query_db(time_range, &db_connection)),
+		    Err(error) => make_error_response(&error),
+		};
+		Box::new(response)
+	    }
+	    (&Post, "/") => {
+		info!("Hey, it's a post to /!");
+		let future = request
+		    .body()
+		    .and_then(parse_form)
+		    .and_then(move |new_message| write_to_db(new_message, &db_connection))
+		    .then(make_post_response);
+		Box::new(future)
+	    }
+	    _ => {
+		info!("Hey, it's not a recognized request");
+		Box::new(futures::future::ok(
+		    Response::new().with_status(StatusCode::NotFound)))
+	    }
+	}
     }
 }
-	    
-
     
 fn main() {
     println!("Hello, world!");
+    env_logger::init();
+    let address = "127.0.0.1:8088".parse().unwrap();
+    let server = Server::bind(&address).unwrap();
+    info!("Running Microservice at {}", address);
+    server.run().unwrap();
+}
+
+fn parse_form(form_chunk: Body) -> Result<NewMessage> {
+    let mut form = url::form_urlencoded::parse(form_chunk.as_ref())
+        .into_owned()
+        .collect::<HashMap<String, String>>();
+    if let Some(message) = form.remove("message") {
+	let username = form.remove("username").unwrap_or(String::from("anonymous"));
+	info!("Parsing form content: {}, {}", username, message);
+	futures::future::ok(NewMessage {
+	    username: username,
+	    message: message,
+	})
+    } else {
+	error!("Parsing form content: {:?}: Missing field 'message'",
+	       io::ErrorKind::InvalidInput);
+	futures::future::err(hyper::Error::from(std::io::Error::new(
+	    io::ErrorKind::InvalidInput, "Missing field 'message'",
+	)))
+    }
+}
+
+fn make_post_response(
+    result: Result<i64>,
+) -> Result<hyper::Response<()>> {
+    match result {
+	Ok(timestamp) => {
+	    let payload = json!({"timestamp": timestamp}).to_string();
+	    let response = Response::new()
+		.headers_mut()
+		.insert(hyper::header::CONTENT_TYPE, HeaderValue::from_str("json"))
+		.insert(hyper::header::CONTENT_LENGTH, HeaderValue::from_static(payload.len() as u64))
+		.with_body(payload);
+	    debug!("{:?}", response);
+	    futures::future::ok(response)
+	}
+	Err(error) => make_error_response(&error.to_string()),
+    }
+}
+		
+fn make_error_response(error_message: &str) -> Result<hyper::Response<()>> {
+    let payload = json!({"error": error_message}).to_string();
+    let response = Response::new()
+	.with_status(StatusCode::InternalServerError)
+	.with_header(hyper::header::CONTENT_LENGTH, HeaderValue::from_static((payload.len() as u64)))
+	.with_body(payload);
+    debug!("{:?}", response);
+    futures::future::ok(response)
+}
+
+fn parse_query(query: &str) -> Result<TimeRange> {
+    let args = url::form_urlencoded::parse(&query.as_bytes()).
+	into_owned()
+	.collect::<HashMap<String, String>>();
+
+    let before = args.get("before").map(|value| value.parse::<i64>());
+    if let Some(ref result) = before {
+	if let Err(ref error) = *result {
+	    return Err(format!("error parsing 'before': {}", error));
+	}
+    }
+
+    let after = args.get("after").map(|value| value.parse::<i64>());
+    if let Some(ref result) = after {
+	if let Err(ref error) = *result {
+	    return Err(format!("Error farsing 'after': {}", error));
+	}
+    }
+
+    Ok(TimeRange {
+	before: before.map(|b| b.unwrap()),
+	after: after.map(|a| a.unwrap()),
+    })
+}
+
+fn make_get_response(
+    messages: Option<Vec<Message>>,
+) -> Result<hyper::Response<()>> {
+    let response = match messages {
+	Some(messages) => {
+	    let body = render_page(messages);
+	    Response::new()
+		.with_header(hyper::header::CONTENT_LENGTH, HeaderValue::from_static((body.len() as u64)))
+		.with_body(body)
+	}
+	None => Response::new().with_status(StatusCode::InternalServerError),
+    };
+    debug!("{:?}", response);
+    futures::future::ok(response)
+}
+
+fn connect_to_db() -> Option<PgConnection> {
+    let database_url = env::var("DATABASE_URL").unwrap_or(String::from(DEFAULT_DATABASE_URL));
+    match PgConnection::establish(&database_url) {
+        Ok(connection) => Some(connection),
+        Err(error) => {
+            error!("Error connecting to database: {}", error.description());
+            None
+        }
+    }
+}
+
+fn write_to_db(
+    new_message: NewMessage,
+    db_connection: &PgConnection,
+) -> Result<i64> {
+    use schema::messages;
+    let timestamp = diesel::insert_into(messages::table)
+        .values(&new_message)
+        .returning(messages::timestamp)
+        .get_result(db_connection);
+
+    match timestamp {
+        Ok(timestamp) => futures::future::ok(timestamp),
+        Err(error) => {
+          error!("Error writing to database: {}", error.description());
+          futures::future::err(hyper::Error::from(
+              io::Error::new(io::ErrorKind::Other, "service error"),
+          ))
+        }
+    }
+}
+
+fn query_db(time_range: TimeRange, db_connection: &PgConnection) -> Option<Vec<Message>> {
+    use schema::messages;
+    let TimeRange { before, after } = time_range;
+    let query_result = match (before, after) {
+	(Some(before), Some(after)) => {
+	    messages::table
+		.filter(messages::timestamp.lt(before as i64))
+		.filter(messages::timestamp.gt(after as i64))
+		.load::<Message>(db_connection)
+	}
+	(Some(before), _) => {
+	    messages::table
+		.filter(messages::timestamp.lt(before as i64))
+		.load::<Message>(db_connection)
+	}
+	(_, Some(after)) => {
+	    messages::table
+		.filter(messages::timestamp.gt(after as i64))
+		.load::<Message>(db_connection)
+	}
+	_ => messages::table.load::<Message>(db_connection),
+    };
+    match query_result {
+	Ok(result) => Some(result),
+	Err(error) => {
+	    error!("Error querying DB: {}", error);
+	    None
+	}
+    }
+}
+
+fn render_page(messages: Option<Vec<Message>>) {
+    info!("got messages: {}", messages);
 }
